@@ -17,6 +17,7 @@ package jupiter
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -26,6 +27,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/douyu/jupiter/pkg"
 	"github.com/douyu/jupiter/pkg/conf"
+	"github.com/douyu/jupiter/pkg/constant"
 	file_datasource "github.com/douyu/jupiter/pkg/datasource/file"
 	http_datasource "github.com/douyu/jupiter/pkg/datasource/http"
 	"github.com/douyu/jupiter/pkg/ecode"
@@ -34,9 +36,12 @@ import (
 	"github.com/douyu/jupiter/pkg/registry"
 	"github.com/douyu/jupiter/pkg/sentinel"
 	"github.com/douyu/jupiter/pkg/server"
+	"github.com/douyu/jupiter/pkg/signals"
 	"github.com/douyu/jupiter/pkg/trace"
 	"github.com/douyu/jupiter/pkg/trace/jaeger"
 	"github.com/douyu/jupiter/pkg/util/xcolor"
+	"github.com/douyu/jupiter/pkg/util/xcycle"
+	"github.com/douyu/jupiter/pkg/util/xdefer"
 	"github.com/douyu/jupiter/pkg/util/xgo"
 	"github.com/douyu/jupiter/pkg/util/xstring"
 	"github.com/douyu/jupiter/pkg/worker"
@@ -48,30 +53,32 @@ import (
 // Application is the framework's instance, it contains the servers, workers, client and configuration settings.
 // Create an instance of Application, by using &Application{}
 type Application struct {
-	servers []server.Server
-	workers []worker.Worker
-	logger  *xlog.Logger
-
+	cycle       *xcycle.Cycle
 	stopOnce    sync.Once
 	initOnce    sync.Once
 	startupOnce sync.Once
+	afterStop   *xdefer.DeferStack
+	beforeStop  *xdefer.DeferStack
+	defers      []func() error
 
+	governorAddr string
+
+	servers    []server.Server
+	workers    []worker.Worker
+	logger     *xlog.Logger
 	registerer registry.Registry
-
-	signalHooker func(*Application)
-	defers       []func() error
-
-	governor *http.Server
 }
 
 // initialize application
 func (app *Application) initialize() {
 	app.initOnce.Do(func() {
+		app.cycle = xcycle.NewCycle()
 		app.servers = make([]server.Server, 0)
 		app.workers = make([]worker.Worker, 0)
 		app.logger = xlog.JupiterLogger
-		app.signalHooker = hookSignals
-		app.defers = []func() error{}
+		// app.defers = []func() error{}
+		app.afterStop = xdefer.NewStack()
+		app.beforeStop = xdefer.NewStack()
 	})
 }
 
@@ -96,6 +103,7 @@ func (app *Application) startup() (err error) {
 	return
 }
 
+//Startup ..
 func (app *Application) Startup(fns ...func() error) error {
 	app.initialize()
 	if err := app.startup(); err != nil {
@@ -104,19 +112,37 @@ func (app *Application) Startup(fns ...func() error) error {
 	return xgo.SerialUntilError(fns...)()
 }
 
+// Defer ..
+// Deprecated: use AfterStop instead
 func (app *Application) Defer(fns ...func() error) {
-	app.initialize()
-	if app.defers == nil {
-		app.defers = make([]func() error, 0)
-	}
-	app.defers = append(app.defers, fns...)
+	app.AfterStop(fns...)
 }
 
+//BeforeStop hook
+func (app *Application) BeforeStop(fns ...func() error) {
+	app.initialize()
+	if app.beforeStop == nil {
+		app.beforeStop = xdefer.NewStack()
+	}
+	app.beforeStop.Push(fns...)
+}
+
+//AfterStop hook
+func (app *Application) AfterStop(fns ...func() error) {
+	app.initialize()
+	if app.afterStop == nil {
+		app.afterStop = xdefer.NewStack()
+	}
+	app.afterStop.Push(fns...)
+}
+
+// Serve start a server
 func (app *Application) Serve(s server.Server) error {
 	app.servers = append(app.servers, s)
 	return nil
 }
 
+// Schedule ..
 func (app *Application) Schedule(w worker.Worker) error {
 	app.workers = append(app.workers, w)
 	return nil
@@ -127,124 +153,152 @@ func (app *Application) SetRegistry(reg registry.Registry) {
 	app.registerer = reg
 }
 
-// SetSignalHooker set signal hooker
-func (app *Application) SetSignalHooker(hook func(*Application)) {
-	app.signalHooker = hook
-}
-
-// SetGovernor governor
-// 127.0.0.1:9990 as default governor addr
+// SetGovernor set governor addr (default 127.0.0.1:0)
 func (app *Application) SetGovernor(addr string) {
-	app.governor = &http.Server{
-		Handler: govern.DefaultServeMux,
-		Addr:    addr,
-	}
+	app.governorAddr = addr
 }
 
 // Run run application
 func (app *Application) Run() error {
+	app.waitSignals() //start signal listen task in goroutine
 	defer app.clean()
-	if app.signalHooker == nil {
-		app.signalHooker = hookSignals
-	}
-	if app.governor == nil {
-		app.governor = &http.Server{
-			Handler: govern.DefaultServeMux,
-			Addr:    "127.0.0.1:9990", // 默认治理端口
-		}
-	}
 
 	if app.registerer == nil {
-		app.registerer = registry.Nop{}
+		app.SetRegistry(registry.Nop{}) //default nop without registry
 	}
 
-	app.signalHooker(app)
-
 	// start govern
-	var eg errgroup.Group
-	eg.Go(app.startGovernor)
-	eg.Go(app.startServers)
-	eg.Go(app.startWorkers)
-	return eg.Wait()
+	app.cycle.Run(app.startGovernor)
+	app.cycle.Run(app.startServers)
+	app.cycle.Run(app.startWorkers)
+
+	if err := <-app.cycle.Wait(); err != nil {
+		app.logger.Error("jupiter shutdown with error", xlog.FieldMod(ecode.ModApp), xlog.FieldErr(err))
+	}
+	app.logger.Info("shutdown jupiter, bye!", xlog.FieldMod(ecode.ModApp))
+	return nil
 }
 
 // Stop application immediately after necessary cleanup
 func (app *Application) Stop() (err error) {
-	app.beforeStop()
 	app.stopOnce.Do(func() {
+		app.beforeStop.Clean()
 		err = app.registerer.Close()
 		if err != nil {
 			app.logger.Error("stop register close err", xlog.FieldMod(ecode.ModApp), xlog.FieldErr(err))
 		}
-		err = app.governor.Close()
-		if err != nil {
-			app.logger.Error("stop governor close err", xlog.FieldMod(ecode.ModApp), xlog.FieldErr(err))
-		}
-		var eg errgroup.Group
+		// err = app.governor.Close()
+		// if err != nil {
+		// 	app.logger.Error("stop governor close err", xlog.FieldMod(ecode.ModApp), xlog.FieldErr(err))
+		// }
+		//stop servers
 		for _, s := range app.servers {
-			s := s
-			eg.Go(s.Stop)
+			func(s server.Server) {
+				app.cycle.Run(s.Stop)
+			}(s)
 		}
+		//stop workers
 		for _, w := range app.workers {
-			w := w
-			eg.Go(w.Stop)
+			func(w worker.Worker) {
+				app.cycle.Run(w.Stop)
+			}(w)
 		}
-		err = eg.Wait()
+		select {
+		case <-app.cycle.Done():
+			app.cycle.Close()
+		}
 	})
 	return
 }
 
 // GracefulStop application after necessary cleanup
 func (app *Application) GracefulStop(ctx context.Context) (err error) {
-	app.beforeStop()
 	app.stopOnce.Do(func() {
+		app.beforeStop.Clean()
 		err = app.registerer.Close()
 		if err != nil {
 			app.logger.Error("graceful stop register close err", xlog.FieldMod(ecode.ModApp), xlog.FieldErr(err))
 		}
-		err = app.governor.Close()
-		if err != nil {
-			app.logger.Error("graceful stop governor close err", xlog.FieldMod(ecode.ModApp), xlog.FieldErr(err))
-		}
-		if err != nil {
-
-		}
-		var eg errgroup.Group
+		// err = app.governor.Close()
+		// if err != nil {
+		// 	app.logger.Error("graceful stop governor close err", xlog.FieldMod(ecode.ModApp), xlog.FieldErr(err))
+		// }
 		for _, s := range app.servers {
-			s := s
-			eg.Go(func() error {
-				return s.GracefulStop(ctx)
-			})
+			func(s server.Server) {
+				app.cycle.Run(func() error {
+					return s.GracefulStop(ctx)
+				})
+			}(s)
 		}
-		err = eg.Wait()
+		for _, w := range app.workers {
+			func(w worker.Worker) {
+				app.cycle.Run(w.Stop)
+			}(w)
+		}
+		select {
+		case <-app.cycle.Done():
+			app.cycle.Close()
+		}
 	})
 	return err
 }
 
-func (app *Application) beforeStop() {
-	// todo(gorexlv): before stop hooks
-	app.logger.Info("leaving jupiter, bye....", xlog.FieldMod(ecode.ModApp))
+// waitSignals wait signal
+func (app *Application) waitSignals() {
+	app.logger.Info("init listen signal", xlog.FieldMod(ecode.ModApp))
+	signals.Shutdown(func(grace bool) { //when get shutdown signal
+		//todo: suport timeout
+		if grace {
+			app.GracefulStop(context.TODO())
+		} else {
+			app.Stop()
+		}
+	})
 }
 
-func (app *Application) startGovernor() (err error) {
-	app.logger.Info("start governor", xlog.FieldMod(ecode.ModApp), xlog.FieldAddr("http://"+app.governor.Addr))
-	defer func() {
-		if err != nil {
-			app.logger.Panic("stop governor", xlog.FieldMod(ecode.ModApp), xlog.FieldErr(err), xlog.FieldAddr("http://"+app.governor.Addr))
-		}
-	}()
-	err = app.governor.ListenAndServe()
-	if err == http.ErrServerClosed {
-		app.logger.Info("stop governor", xlog.FieldMod(ecode.ModApp), xlog.FieldAddr("http://"+app.governor.Addr))
-		return nil
+func (app *Application) startGovernor() error {
+	//todo: abstract governor struct
+	if len(app.governorAddr) == 0 {
+		app.governorAddr = conf.GetString("jupiter.governor.addr")
+	}
+	if len(app.governorAddr) == 0 {
+		app.SetGovernor(":0") // default governor addr
+	}
+	var governor = &http.Server{
+		Addr:    app.governorAddr,
+		Handler: govern.DefaultServeMux,
+	}
+	var listener, err = net.Listen("tcp4", app.governorAddr)
+	if err != nil {
+		xlog.Panic("start governor", xlog.FieldErr(err))
+	}
+	app.BeforeStop(func() error {
+		app.logger.Info("stop governor", xlog.FieldMod(ecode.ModApp), xlog.FieldAddr("http://"+listener.Addr().String()))
+		return listener.Close()
+	})
+
+	app.logger.Info("start governor", xlog.FieldMod(ecode.ModApp), xlog.FieldAddr("http://"+listener.Addr().String()))
+	serviceInfo := &server.ServiceInfo{
+		Name:    pkg.Name(),
+		Scheme:  "http",
+		Address: listener.Addr().String(),
+		Kind:    constant.ServiceGovernor,
 	}
 
-	return err
+	if err := app.registerer.RegisterService(context.Background(), serviceInfo); err == nil {
+		app.BeforeStop(func() error { return app.registerer.DeregisterService(context.Background(), serviceInfo) })
+	}
+	if err := governor.Serve(listener); err != nil {
+		if err == http.ErrServerClosed {
+			app.logger.Info("stop governor", xlog.FieldMod(ecode.ModApp), xlog.FieldAddr("http://"+listener.Addr().String()))
+			return nil
+		}
+	}
+	return nil
 }
 
 func (app *Application) startServers() error {
 	var eg errgroup.Group
-	xgo.ParallelWithErrorChan()
 	// start multi servers
 	for _, s := range app.servers {
 		s := s
@@ -367,7 +421,7 @@ func (app *Application) initTracer() error {
 func (app *Application) initSentinel() error {
 	// init reliability component sentinel
 	if conf.Get("jupiter.reliability.sentinel") != nil {
-		app.logger.Info("init reliability component sentinel")
+		app.logger.Info("init sentinel")
 		return sentinel.RawConfig("jupiter.reliability.sentinel").
 			InitSentinelCoreComponent()
 	}

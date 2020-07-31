@@ -12,34 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+// +build windows
+
+package signals
 
 import (
-	"fmt"
-	"log"
-
-	"github.com/douyu/jupiter/example/all/internal/app/demo"
-	"github.com/douyu/jupiter/pkg/registry/compound"
-	"github.com/douyu/jupiter/pkg/registry/etcdv3"
+	"os"
+	"syscall"
 )
 
-func main() {
-	eng := demo.NewEngine()
-
-	eng.AfterStop(func() error {
-		fmt.Println("exit...")
-		return nil
-	})
-
-	eng.SetGovernor("127.0.0.1:9391")
-
-	eng.SetRegistry( // 多注册中心
-		compound.New(
-			etcdv3.StdConfig("wh01").BuildRegistry(),
-		),
-	)
-
-	if err := eng.Run(); err != nil {
-		log.Fatal(err)
-	}
-}
+var shutdownSignals = []os.Signal{syscall.SIGQUIT, os.Interrupt}

@@ -12,34 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package xp2c
 
-import (
-	"fmt"
-	"log"
+import "google.golang.org/grpc/balancer"
 
-	"github.com/douyu/jupiter/example/all/internal/app/demo"
-	"github.com/douyu/jupiter/pkg/registry/compound"
-	"github.com/douyu/jupiter/pkg/registry/etcdv3"
-)
-
-func main() {
-	eng := demo.NewEngine()
-
-	eng.AfterStop(func() error {
-		fmt.Println("exit...")
-		return nil
-	})
-
-	eng.SetGovernor("127.0.0.1:9391")
-
-	eng.SetRegistry( // 多注册中心
-		compound.New(
-			etcdv3.StdConfig("wh01").BuildRegistry(),
-		),
-	)
-
-	if err := eng.Run(); err != nil {
-		log.Fatal(err)
-	}
+type P2c interface {
+	// Next returns next selected item.
+	Next() (interface{}, func(balancer.DoneInfo))
+	// Add a item.
+	Add(interface{})
 }
